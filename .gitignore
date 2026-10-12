@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.py[cod]
+models/
+cluster_task/
+cluster_result/
+cluster_tasks/
+cluster_results/
+.env
+.env.*
+!.env.example
+*.log

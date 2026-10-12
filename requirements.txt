@@ -1,0 +1,9 @@
+fastapi
+httpx
+joblib
+numpy
+psutil
+requests
+scikit-learn
+torch
+uvicorn
