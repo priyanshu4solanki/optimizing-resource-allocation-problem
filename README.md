@@ -1,5 +1,8 @@
 # Offline cloud task allocation demo
 
+For the complete architecture, pipeline walkthrough, component roles, and
+limitations, see [PROJECT_GUIDE.md](./PROJECT_GUIDE.md).
+
 This folder contains an offline demonstration and the live folder-driven
 allocation service. In the live workflow, a user uploads a `.py` script into
 `cluster_task`; the hub writes an assignment JSON ticket beside the script,
