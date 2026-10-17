@@ -7,8 +7,13 @@ the assigned worker executes it, and the output is stored in `cluster_result`.
 
 The task's file size is measured by the hub and used as both `file_size` and
 `disk_size`; Python scripts are typed as `text`, and baseline resource hints
-default to zero. Tasks uploaded as scripts currently form independent jobs.
-The offline path also supports explicit dependencies:
+default to zero. The folder watcher uses Python AST static analysis to detect
+simple imports that match other `.py` scripts in the task directory and records
+those as candidate parent dependencies. Workers wait for parent tickets to
+complete before running dependent tasks. This is a narrow heuristic: it does
+not detect dynamic imports, file/data dependencies, or prove that an import
+requires the imported script to execute first. Explicit dependencies are also
+supported by the offline and batch-submission paths:
 
 ```text
 TaskInput + InfrastructureContext
@@ -79,6 +84,11 @@ ticket status and output-file location.
 For live Python uploads, a GPU hint of zero means CPU-only; set a positive GPU
 hint to require GPU capacity. The scheduler cannot reliably infer whether an
 arbitrary Python script uses a GPU from its file size and file type alone.
+Import-based dependencies are only inferred when the imported module exactly
+matches another task script's filename stem, such as `from provider import run`
+matching `provider.py`. Standard libraries and third-party packages without a
+matching task script are ignored. Use explicit parent declarations for
+dependencies that AST import matching cannot represent.
 
 The hub remains available for telemetry without models. Script uploads require
 the API token; if model paths or eligible live nodes are not configured yet,
@@ -111,10 +121,29 @@ Requires Python 3.10+, PyTorch, NumPy, scikit-learn, and joblib:
 python main_engine.py --tasks 8 --seed 7 --checkpoint-dir models
 ```
 
+The command trains the synthetic demo models and saves reusable checkpoints in
+`models/`. To start the local live hub later without rerunning training, point
+the hub to those saved files before starting it:
+
+```powershell
+$env:MARL_PREDICTOR_PATH = "$PWD\models\task_predictor.joblib"
+$env:MARL_GNN_PATH = "$PWD\models\task_gnn.pt"
+$env:MARL_SCHEDULER_PATH = "$PWD\models\marl_scheduler.pt"
+$env:MARL_TASKS_DIR = "C:\marl-test\cluster_task"
+$env:MARL_NODE_IDS = "S1"
+$env:MARL_API_TOKEN = "<long-random-secret>"
+python hub.py
+```
+
+These are synthetic demonstration checkpoints for local integration testing,
+not production models. Re-run `main_engine.py` only when intentionally
+regenerating or retraining the demo checkpoints.
+
 Run the local four-agent integration test (uses simulated heartbeats and
 temporary task/result folders, not real machines or network shares):
 
 ```powershell
+python -m unittest discover -s . -p "test*.py"
 python test_live_flow.py
 python test_learning_quality.py
 ```
@@ -130,6 +159,17 @@ estimates plus normalized file/infrastructure features. It reports held-out
 resource MAE and only enables its resource-refinement head when that validation
 MAE does not regress from the predictor baseline. Its graph embeddings still
 feed the placement policy.
+
+To export the exact 600 generated examples, predictor estimates, normalized GNN
+inputs, synthetic labels, and artificial train/validation graph links:
+
+```powershell
+python export_gnn_synthetic_dataset.py
+```
+
+This writes `gnn_synthetic_training_dataset.csv` and a metadata JSON file.
+These rows and graph links are synthetic demo material, not observed workloads
+or real task dependencies.
 
 ## Integrate with measured inputs
 
@@ -169,3 +209,59 @@ for pending resource reservations, writes task-runner tickets, and uses
 completed execution time/cost as PPO feedback. Production use still requires
 measured training data and policy training, shared-directory configuration,
 and workers isolated appropriately for submitted scripts.
+
+## Prepare the supplied cloud-task dataset
+
+`prepare_cloud_model_dataset.py` reads a CSV or a ZIP containing one CSV,
+keeps 20 task, outcome, and evaluation columns, and writes a cleaned CSV plus a
+JSON metadata sidecar. Example:
+
+```powershell
+python prepare_cloud_model_dataset.py `
+  --input "C:\Users\<user>\Downloads\archive (11).zip" `
+  --output "C:\Users\<user>\Downloads\Cloud_Model_Dataset_cleaned.csv"
+```
+
+The cleaned data converts observed execution time from milliseconds to seconds.
+`target_ram_allocated_mb` is calculated as `Memory_Share (%)` multiplied by
+`VM_Total_Memory_Capacity (MB)`; `target_ram_used_mb` retains measured
+`Memory_Consumption (MB)`. That consumption is also copied to
+`task_size_proxy_mb` at the user's request, but it is a post-execution
+measurement—not the input file size—and must not be used as a pre-execution
+model feature.
+
+The source has no GPU measurements. `gpu_required_pseudo_label` and
+`gpu_requirement_units_pseudo` are explicitly heuristic labels: they are 1
+when both observed CPU utilization and observed memory consumption are at or
+above their respective dataset 75th percentiles, and 0 otherwise. For the
+provided file those thresholds are 69.85% and 6039 MB. This rule is not evidence
+that a task can use a GPU or benefits from one. Do not treat these columns as
+ground-truth GPU labels for production training.
+
+The cleaned CSV is a curated research/training table, not yet a drop-in
+replacement for the live predictor schema. Its `target_*` columns and
+observed bandwidth/size values describe outcomes and should not be fed as
+pre-execution inputs. The original data also has timestamps only to minute
+precision, so use `Task_Execution_Time (ms)` rather than subtracting start/end
+timestamps for duration labels. Check units, provenance, leakage, and
+held-out performance before retraining production models.
+
+Train dataset-specific models and save chronological held-out metrics with:
+
+```powershell
+python train_cloud_dataset.py `
+  --input "C:\Users\<user>\Downloads\Cloud_Model_Dataset_cleaned.csv" `
+  --artifact "C:\Users\<user>\Downloads\cloud_dataset_models.joblib" `
+  --metrics "C:\Users\<user>\Downloads\cloud_dataset_training_metrics.json"
+```
+
+The training script uses `data_source`, `task_type`, `job_priority`,
+`predicted_load_condition`, and `number_of_active_users` as candidate
+pre-execution features. It excludes measured task size, observed bandwidth,
+resource outcomes, and host-selection outcomes from model inputs. Outputs
+include execution time, CPU utilization, CPU allocation percentage, allocated
+RAM, and used RAM; the latter two have different meanings. The dataset-trained
+artifact has a different schema and target units from the live hub's current
+`TaskResourcePredictor` and must not be configured as `MARL_PREDICTOR_PATH`.
+Its GPU model only learns the synthetic pseudo-label and is explicitly marked
+not suitable for deployment.

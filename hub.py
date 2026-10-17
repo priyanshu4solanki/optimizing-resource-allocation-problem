@@ -21,6 +21,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field
 
+from ast_dependency_detector import (
+    DependencyAnalysisError,
+    detect_import_dependencies,
+)
 from gnn_encoder import (
     TaskGraphEncoder,
     build_dependency_edges,
@@ -365,49 +369,145 @@ class HubRuntime:
             if filename in current_names
         }
 
-        scheduled = 0
-        for filename, file_size in stable_uploads:
+        available_scripts = {
+            path.name
+            for path in self.task_directory.glob("*.py")
+            if path.is_file()
+            and path.resolve().parent == self.task_directory.resolve()
+            and TASK_SCRIPT_PATTERN.fullmatch(path.name)
+        }
+        stable_names = {filename for filename, _ in stable_uploads}
+        import_dependencies = {}
+        analyzable_names = set()
+        for filename in stable_names:
             try:
-                task_id = Path(filename).stem
-                hints_path = self.task_directory / f"{task_id}.hints.json"
-                if hints_path.exists():
-                    hints = json.loads(hints_path.read_text(encoding="utf-8"))
-                    if not isinstance(hints, dict):
-                        raise ValueError("task hints must be a JSON object")
-                else:
-                    hints = {}
-                task = SubmittedTask(
-                    task_id=task_id,
-                    script_name=filename,
-                    file_size=file_size / 1024,
-                    disk_size=file_size / 1024,
-                    doc_type=hints.get("doc_type", "text"),
-                    baseline_cpu_req=hints.get("baseline_cpu_req", 0.0),
-                    baseline_gpu_req=hints.get("baseline_gpu_req", 0.0),
+                import_dependencies.update(
+                    detect_import_dependencies(
+                        {filename: self.task_directory / filename},
+                        available_scripts,
+                    )
                 )
-                if (self.task_directory / f"{task_id}.json").exists():
-                    self.observed_uploads.pop(filename, None)
+                analyzable_names.add(filename)
+            except DependencyAnalysisError:
+                LOGGER.exception(
+                    "Could not statically analyze imports in task %s; "
+                    "scheduling without inferred dependencies",
+                    filename,
+                )
+                import_dependencies[filename] = ()
+                analyzable_names.add(filename)
+
+        ready_uploads = []
+        for filename, file_size in stable_uploads:
+            if filename not in analyzable_names:
+                continue
+            unresolved_parents = [
+                parent
+                for parent in import_dependencies[filename]
+                if parent not in stable_names
+                and not (self.task_directory / f"{Path(parent).stem}.json").is_file()
+            ]
+            if unresolved_parents:
+                LOGGER.info(
+                    "Deferring task %s until imported task(s) are stable: %s",
+                    filename,
+                    ", ".join(unresolved_parents),
+                )
+                continue
+            ready_uploads.append((filename, file_size))
+
+        scheduled = 0
+        pending_by_name = dict(ready_uploads)
+        while pending_by_name:
+            component_names = {min(pending_by_name)}
+            changed = True
+            while changed:
+                changed = False
+                for filename in tuple(pending_by_name):
+                    linked = set(import_dependencies[filename])
+                    linked.update(
+                        child
+                        for child, parents in import_dependencies.items()
+                        if filename in parents
+                    )
+                    if component_names.intersection(linked) and filename not in component_names:
+                        component_names.add(filename)
+                        changed = True
+
+            component_uploads = [
+                (filename, pending_by_name.pop(filename))
+                for filename in sorted(component_names)
+                if filename in pending_by_name
+            ]
+            try:
+                tasks = []
+                for filename, file_size in component_uploads:
+                    task_id = Path(filename).stem
+                    hints_path = self.task_directory / f"{task_id}.hints.json"
+                    if hints_path.exists():
+                        hints = json.loads(hints_path.read_text(encoding="utf-8"))
+                        if not isinstance(hints, dict):
+                            raise ValueError("task hints must be a JSON object")
+                    else:
+                        hints = {}
+                    parents = [
+                        Path(parent).stem
+                        for parent in import_dependencies[filename]
+                    ]
+                    tasks.append(
+                        SubmittedTask(
+                            task_id=task_id,
+                            script_name=filename,
+                            file_size=file_size / 1024,
+                            disk_size=file_size / 1024,
+                            doc_type=hints.get("doc_type", "text"),
+                            parents=parents,
+                            baseline_cpu_req=hints.get("baseline_cpu_req", 0.0),
+                            baseline_gpu_req=hints.get("baseline_gpu_req", 0.0),
+                        )
+                    )
+                existing_tasks = [
+                    task
+                    for task in tasks
+                    if not (self.task_directory / f"{task.task_id}.json").exists()
+                ]
+                if not existing_tasks:
                     continue
-                result = self._submit_unlocked(TaskBatch(tasks=[task]))
-                LOGGER.info("Assigned uploaded task %s: %s", task_id, result)
-                scheduled += 1
-                self.observed_uploads.pop(filename, None)
-                self.schedule_retry_log_times.pop(filename, None)
+                result = self._submit_unlocked(TaskBatch(tasks=existing_tasks))
+                LOGGER.info(
+                    "Assigned uploaded task group %s: %s",
+                    ", ".join(task.task_id for task in existing_tasks),
+                    result,
+                )
+                scheduled += len(existing_tasks)
+                for task in existing_tasks:
+                    self.observed_uploads.pop(task.script_name, None)
+                    self.schedule_retry_log_times.pop(task.script_name, None)
             except HTTPException as error:
-                if error.status_code in (422, 503):
-                    now = time.monotonic()
-                    last_log = self.schedule_retry_log_times.get(filename, 0.0)
-                    if now - last_log >= SCHEDULE_RETRY_LOG_INTERVAL_SEC:
+                for task in tasks:
+                    if error.status_code in (422, 503):
+                        now = time.monotonic()
+                        last_log = self.schedule_retry_log_times.get(
+                            task.script_name, 0.0
+                        )
+                        if now - last_log >= SCHEDULE_RETRY_LOG_INTERVAL_SEC:
+                            LOGGER.warning(
+                                "Uploaded task %s is waiting for an eligible scheduler: %s",
+                                task.script_name,
+                                error.detail,
+                            )
+                            self.schedule_retry_log_times[task.script_name] = now
+                    else:
                         LOGGER.warning(
-                            "Uploaded task %s is waiting for an eligible scheduler: %s",
-                            filename,
+                            "Could not schedule uploaded task %s: %s",
+                            task.script_name,
                             error.detail,
                         )
-                        self.schedule_retry_log_times[filename] = now
-                else:
-                    LOGGER.warning("Could not schedule uploaded task %s: %s", filename, error.detail)
             except (OSError, ValueError, RuntimeError):
-                LOGGER.exception("Unexpected failure scheduling uploaded task %s", filename)
+                LOGGER.exception(
+                    "Unexpected failure scheduling uploaded task group %s",
+                    ", ".join(task.script_name for task in tasks),
+                )
         return scheduled
 
     def _submit_unlocked(self, batch: TaskBatch) -> Dict[str, Any]:
@@ -422,12 +522,36 @@ class HubRuntime:
         task_ids = [task.task_id for task in batch.tasks]
         if len(set(task_ids)) != len(task_ids):
             raise HTTPException(status_code=422, detail="task IDs must be unique")
+        task_id_set = set(task_ids)
+        for task in batch.tasks:
+            for parent in task.parents:
+                if not TASK_SCRIPT_PATTERN.fullmatch(f"{parent}.py"):
+                    raise HTTPException(
+                        status_code=422,
+                        detail=f"invalid dependency task ID: {parent!r}",
+                    )
         try:
             edge_index = build_dependency_edges(
-                task_ids, {task.task_id: task.parents for task in batch.tasks}
+                task_ids,
+                {
+                    task.task_id: tuple(
+                        parent for parent in task.parents if parent in task_id_set
+                    )
+                    for task in batch.tasks
+                },
             )
         except ValueError as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
+
+        for task in batch.tasks:
+            for parent in task.parents:
+                if parent not in task_id_set and not (
+                    self.task_directory / f"{parent}.json"
+                ).is_file():
+                    raise HTTPException(
+                        status_code=422,
+                        detail=f"dependency task {parent!r} has no task ticket",
+                    )
 
         scripts = {}
         for task in batch.tasks:
@@ -864,7 +988,11 @@ def _reserve(prediction: PredictedTask, capacity: Dict[str, float]) -> None:
 def _topological_order(
     task_ids: Sequence[str], tasks: Sequence[SubmittedTask]
 ) -> List[str]:
-    parents = {task.task_id: task.parents for task in tasks}
+    task_id_set = set(task_ids)
+    parents = {
+        task.task_id: tuple(parent for parent in task.parents if parent in task_id_set)
+        for task in tasks
+    }
     remaining = set(task_ids)
     emitted = set()
     order = []

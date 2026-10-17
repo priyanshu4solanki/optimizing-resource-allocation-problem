@@ -20,10 +20,136 @@ from hub import (
 )
 from marl_scheduler import MARLScheduler
 from task_predictors import TaskResourcePredictor, generate_synthetic_training_data
-from task_runner import run_worker
+from task_runner import _dependencies, run_worker
 
 
 class LiveTaskFlowTest(unittest.TestCase):
+    def test_folder_scan_detects_import_dependencies_and_worker_waits(self) -> None:
+        training_tasks, training_contexts = generate_synthetic_training_data(
+            sample_count=32, seed=103
+        )
+        predictor = TaskResourcePredictor(random_state=103)
+        predictor.fit_synthetic(training_tasks, training_contexts)
+        models = ModelBundle(
+            predictor=predictor,
+            encoder=TaskGraphEncoder(input_dim=12, hidden_dim=8, embedding_dim=8),
+            scheduler=MARLScheduler(
+                input_dim=15, hidden_dim=16, update_epochs=1
+            ),
+        )
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            task_directory = Path(temporary_directory) / "cluster_task"
+            task_directory.mkdir()
+            (task_directory / "provider.py").write_text(
+                "def value():\n    return 42\n", encoding="utf-8"
+            )
+            (task_directory / "consumer.py").write_text(
+                "from provider import value\nprint(value())\n",
+                encoding="utf-8",
+            )
+            runtime = HubRuntime(
+                node_ids=("CPU1",),
+                models=models,
+                task_directory=task_directory,
+                heartbeat_timeout_sec=60,
+                upload_stability_sec=0,
+            )
+            runtime.ingest(
+                TelemetryPacket(
+                    node_id="CPU1",
+                    ip_address="127.0.0.1",
+                    timestamp=time.time(),
+                    status="FREE",
+                    metrics=Metrics(
+                        cpu_percent=5,
+                        ram_percent=20,
+                        ram_free_gb=8,
+                        ram_total_gb=16,
+                        active_tasks=0,
+                        net_tx_kbps=10,
+                        net_rx_kbps=10,
+                        rtt_ms=1,
+                        cores_logical=8,
+                        gpu_count=0,
+                        gpu_percent=0,
+                        cost_per_second=0.03,
+                    ),
+                )
+            )
+
+            self.assertEqual(runtime.scan_uploaded_scripts(), 0)
+            self.assertEqual(runtime.scan_uploaded_scripts(), 2)
+            provider_ticket = json.loads(
+                (task_directory / "provider.json").read_text(encoding="utf-8")
+            )
+            consumer_ticket = json.loads(
+                (task_directory / "consumer.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(consumer_ticket["depends_on"], ["provider"])
+            self.assertEqual(_dependencies(consumer_ticket, task_directory), "waiting")
+
+            provider_ticket["status"] = "COMPLETED"
+            (task_directory / "provider.json").write_text(
+                json.dumps(provider_ticket), encoding="utf-8"
+            )
+            self.assertEqual(_dependencies(consumer_ticket, task_directory), "ready")
+
+    def test_folder_scan_schedules_script_with_syntax_error_without_dependencies(self) -> None:
+        training_tasks, training_contexts = generate_synthetic_training_data(
+            sample_count=32, seed=104
+        )
+        predictor = TaskResourcePredictor(random_state=104)
+        predictor.fit_synthetic(training_tasks, training_contexts)
+        models = ModelBundle(
+            predictor=predictor,
+            encoder=TaskGraphEncoder(input_dim=12, hidden_dim=8, embedding_dim=8),
+            scheduler=MARLScheduler(
+                input_dim=15, hidden_dim=16, update_epochs=1
+            ),
+        )
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            task_directory = Path(temporary_directory) / "cluster_task"
+            task_directory.mkdir()
+            (task_directory / "broken.py").write_text("if:\n", encoding="utf-8")
+            runtime = HubRuntime(
+                node_ids=("CPU1",),
+                models=models,
+                task_directory=task_directory,
+                heartbeat_timeout_sec=60,
+                upload_stability_sec=0,
+            )
+            runtime.ingest(
+                TelemetryPacket(
+                    node_id="CPU1",
+                    ip_address="127.0.0.1",
+                    timestamp=time.time(),
+                    status="FREE",
+                    metrics=Metrics(
+                        cpu_percent=5,
+                        ram_percent=20,
+                        ram_free_gb=8,
+                        ram_total_gb=16,
+                        active_tasks=0,
+                        net_tx_kbps=10,
+                        net_rx_kbps=10,
+                        rtt_ms=1,
+                        cores_logical=8,
+                        gpu_count=0,
+                        gpu_percent=0,
+                        cost_per_second=0.03,
+                    ),
+                )
+            )
+
+            self.assertEqual(runtime.scan_uploaded_scripts(), 0)
+            self.assertEqual(runtime.scan_uploaded_scripts(), 1)
+            ticket = json.loads(
+                (task_directory / "broken.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(ticket["depends_on"], [])
+
     def test_unhinted_python_task_is_schedulable_on_cpu_only_nodes(self) -> None:
         training_tasks, training_contexts = generate_synthetic_training_data(
             sample_count=32, seed=102
