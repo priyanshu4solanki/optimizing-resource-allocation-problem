@@ -33,10 +33,11 @@ and learns from completed-task feedback.
 
 ## Run the live hub
 
-Install the dependencies in `requirements.txt`. Train the predictor on measured
-resource labels and save the fitted model; save the GNN encoder and scheduler
-checkpoints with the persistence helpers. Then configure paths and start the
-hub from this folder:
+Install the dependencies in `requirements.txt`. By default, the hub loads
+`models/task_predictor.joblib`, `models/task_gnn.pt`, and the trained
+`results/mappo_reference_1000/mappo_scheduler.pt` checkpoint when all three
+files are present. To use different model files, set all three paths as below,
+then start the hub from this folder:
 
 ```powershell
 $env:MARL_PREDICTOR_PATH = "C:\models\task_predictor.joblib"
@@ -141,6 +142,49 @@ python hub.py
 These are synthetic demonstration checkpoints for local integration testing,
 not production models. Re-run `main_engine.py` only when intentionally
 regenerating or retraining the demo checkpoints.
+
+## Train the adapted MAPPO scheduler
+
+To adapt the MAPPO approach from
+[YashSigchi/Capstone_MARL](https://github.com/YashSigchi/Capstone_MARL) while
+keeping this project's predictor/GNN inputs unchanged, first retain the
+predictor and GNN checkpoints, then run:
+
+```powershell
+python main_engine.py --tasks 8 --seed 7 --checkpoint-dir models
+python train_reference_mappo.py --episodes 300 --tasks 8 --eval-seeds 20 --seed 42
+```
+
+The training command updates only the MAPPO scheduler. It saves
+`results/mappo_reference/mappo_scheduler.pt`, the per-episode CSV and log,
+configuration, held-out evaluation JSON, and training/evaluation plots. The
+hub defaults to the available 1,000-episode checkpoint at
+`results/mappo_reference_1000/mappo_scheduler.pt`. Set
+`MARL_SCHEDULER_PATH` to a different saved checkpoint to override that
+default. This checkpoint expects three candidate servers.
+
+The simulation uses synthetic deadlines for SLA scoring and a cost-derived
+energy proxy because the local simulator does not model actual power. Treat
+these as reproducible simulated results, not production measurements. For the
+state/action/reward adaptation and saved artifact details, see
+[PROJECT_GUIDE.md](./PROJECT_GUIDE.md).
+
+The completed seed-42 run (300 training episodes, 20 held-out seeds) scored
+mean reward `0.4868` for trained MAPPO, compared with `-0.1905` for untrained
+MAPPO, `0.3930` for cheapest, and `0.4884` for fastest. Trained MAPPO reached
+100% completion with no rejections, but was slightly below fastest
+(`-0.0015` reward); do not claim it outperforms that baseline. The full
+per-seed metrics are in `results/mappo_reference/evaluation.json`.
+
+To use the 300-episode checkpoint instead of the default 1,000-episode one,
+set this before starting `hub.py` (and set the predictor and GNN paths as
+above):
+
+```powershell
+$env:MARL_PREDICTOR_PATH = "$PWD\models\task_predictor.joblib"
+$env:MARL_GNN_PATH = "$PWD\models\task_gnn.pt"
+$env:MARL_SCHEDULER_PATH = "$PWD\results\mappo_reference\mappo_scheduler.pt"
+```
 
 Run the local four-agent integration test (uses simulated heartbeats and
 temporary task/result folders, not real machines or network shares):

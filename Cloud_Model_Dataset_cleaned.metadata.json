@@ -1,0 +1,40 @@
+{
+  "rows": 5000,
+  "source_columns": 43,
+  "output_columns": [
+    "job_id",
+    "task_start_time",
+    "data_source",
+    "task_type",
+    "job_priority",
+    "number_of_active_users",
+    "predicted_load_condition",
+    "observed_network_bandwidth_utilization_mbps",
+    "task_size_proxy_mb",
+    "target_execution_time_sec",
+    "target_cpu_utilization_pct",
+    "target_cpu_allocation_pct",
+    "target_ram_allocated_mb",
+    "target_ram_used_mb",
+    "target_waiting_time_ms",
+    "actual_host_id",
+    "predicted_host_id",
+    "host_selection_correct",
+    "gpu_required_pseudo_label",
+    "gpu_requirement_units_pseudo"
+  ],
+  "cpu_high_threshold_pct_q75": 69.85,
+  "task_size_proxy_threshold_mb_q75": 6039.0,
+  "gpu_pseudo_positive_rows": 310,
+  "gpu_pseudo_positive_fraction": 0.062,
+  "gpu_pseudo_label_rule": "1 GPU unit if observed CPU utilization and observed memory consumption are both at or above their dataset 75th percentiles; otherwise 0",
+  "warnings": [
+    "GPU labels are heuristic pseudo-labels, not measured GPU need or use.",
+    "Memory_Consumption is post-execution RAM use, not input file size. task_size_proxy_mb is retained for analysis and GPU-label construction but must not be used as a pre-execution model input.",
+    "CPU utilization and other target_* columns are observed outcomes and must not be used as pre-execution model inputs.",
+    "target_ram_allocated_mb is Memory_Share percent multiplied by VM memory capacity; it represents allocated RAM, not necessarily used RAM.",
+    "The dataset has no task file-size field and no measured GPU telemetry."
+  ],
+  "source_archive": "archive (11).zip",
+  "source_member": "Cloud_Model_Dataset.csv"
+}

@@ -13,7 +13,7 @@ import time
 from dataclasses import dataclass
 from math import isfinite
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple, Union
 
 import torch
 from fastapi import FastAPI, Header, HTTPException, Request
@@ -32,6 +32,7 @@ from gnn_encoder import (
 )
 from marl_scheduler import MARLScheduler, SchedulerExperience
 from marl_scheduler_bridge import build_joint_state
+from mappo_scheduler import MAPPOScheduler, load_scheduler_checkpoint
 from model_persistence import load_gnn_encoder, load_predictor
 from task_predictors import (
     InfrastructureContext,
@@ -99,23 +100,33 @@ class TaskBatch(BaseModel):
 class ModelBundle:
     predictor: TaskResourcePredictor
     encoder: TaskGraphEncoder
-    scheduler: MARLScheduler
+    scheduler: Union[MARLScheduler, MAPPOScheduler]
 
 
 def load_model_bundle_from_environment() -> Optional[ModelBundle]:
-    """Load all production model paths from environment, or no bundle if unset."""
+    """Load configured model paths, or the local trained checkpoints by default."""
     names = ("MARL_PREDICTOR_PATH", "MARL_GNN_PATH", "MARL_SCHEDULER_PATH")
-    values = [os.environ.get(name) for name in names]
-    if not any(values):
-        return None
-    if not all(values):
+    configured_paths = [os.environ.get(name) for name in names]
+    if not any(configured_paths):
+        project_root = Path(__file__).resolve().parent
+        default_paths = (
+            project_root / "models" / "task_predictor.joblib",
+            project_root / "models" / "task_gnn.pt",
+            project_root / "results" / "mappo_reference_1000" / "mappo_scheduler.pt",
+        )
+        if not all(path.is_file() for path in default_paths):
+            return None
+        paths = [str(path) for path in default_paths]
+    elif not all(configured_paths):
         raise RuntimeError(
             "Set MARL_PREDICTOR_PATH, MARL_GNN_PATH, and MARL_SCHEDULER_PATH together"
         )
+    else:
+        paths = [str(path) for path in configured_paths]
     device = torch.device(os.environ.get("MARL_DEVICE", "cpu"))
-    predictor = load_predictor(values[0])
-    encoder = load_gnn_encoder(values[1], device=device)
-    scheduler = MARLScheduler.load(values[2], device=device)
+    predictor = load_predictor(paths[0])
+    encoder = load_gnn_encoder(paths[1], device=device)
+    scheduler = load_scheduler_checkpoint(paths[2], device=device)
     if scheduler.input_dim != encoder.embedding_dim + 7:
         raise ValueError(
             "scheduler checkpoint input_dim must equal GNN embedding_dim + 7"

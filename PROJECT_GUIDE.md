@@ -48,6 +48,8 @@ the live workflow obtains worker telemetry and real script completion results.
 | `ast_dependency_detector.py` | Parses stable Python task scripts without running them and detects imports that match other task script filenames. |
 | `marl_scheduler_bridge.py` | Combines each task embedding with each candidate server's telemetry and carries the feasibility mask and IDs. |
 | `marl_scheduler.py` | Selects feasible task-to-server actions and updates a shared actor/centralized critic policy with PPO. |
+| `mappo_scheduler.py` | Provides a parameter-shared task actor, centralized critic, masked actions, GAE, and clipped PPO; its checkpoint can be loaded by the live hub. |
+| `train_reference_mappo.py` | Trains and evaluates adapted MAPPO while keeping the existing predictor and GNN checkpoints fixed. |
 | `main_engine.py` | Runs the offline end-to-end simulation and can save model checkpoints. |
 | `model_persistence.py` | Saves and loads the task predictor, GNN encoder, and scheduler. |
 
@@ -324,7 +326,53 @@ dataset were generally close to a mean baseline, and the pseudo-label GPU
 classifier did not identify positive cases. Do not present these results as
 validated production model accuracy.
 
-## 11. Limitations and responsible interpretation
+## 11. Train the adapted reference MAPPO scheduler
+
+The linked
+[Capstone_MARL](https://github.com/YashSigchi/Capstone_MARL) project uses a
+shared MAPPO actor, centralized critic, masked discrete actions, GAE, PPO
+clipping, and a weighted local/global reward. `train_reference_mappo.py`
+adapts those mechanics to the existing predictor/GNN outputs without changing
+their inputs or the seven-value server telemetry in the bridge.
+
+Create or retain the fixed predictor and GNN checkpoints, then train:
+
+```powershell
+python main_engine.py --tasks 8 --seed 7 --checkpoint-dir models
+python train_reference_mappo.py --episodes 300 --tasks 8 --eval-seeds 20 --seed 42
+```
+
+For three servers, the policy action set is feasible server placement, defer
+once, and reject. The reward follows the reference's nine fixed components
+(latency, energy, utilization, load balance, SLA, queue, throughput, action,
+and admission) and local/global blend. Deadlines are synthetic reward-only
+values based on the predicted execution time; energy is proxied from simulated
+cost because the existing simulator has no power telemetry.
+
+The run saves `results/mappo_reference/mappo_scheduler.pt`,
+`training_history.csv`, `training.log`, `config.json`, `evaluation.json`,
+`training_curves.png`, and `evaluation_comparison.png`. Evaluation uses the
+same held-out seeds for untrained MAPPO, trained MAPPO, random-feasible,
+cheapest, and fastest policies. These are simulated results, not measured
+production performance. The predictor and GNN are loaded from `models/` and
+are not retrained.
+
+When all default model files are present, the live hub loads
+`models/task_predictor.joblib`, `models/task_gnn.pt`, and the trained
+`results/mappo_reference_1000/mappo_scheduler.pt` automatically. Set
+`MARL_PREDICTOR_PATH`, `MARL_GNN_PATH`, and `MARL_SCHEDULER_PATH` together to
+override those paths. The MAPPO checkpoint is trained for three servers, so
+the bridge candidate count must also be three. The hub supports both this
+checkpoint and the original `marl_scheduler.pt` checkpoint format.
+
+The completed seed-42 run trained for 300 episodes and evaluated 20 held-out
+seeds. Mean reward was `0.4868` for trained MAPPO, `-0.1905` for untrained
+MAPPO, `0.0085` for random-feasible, `0.3930` for cheapest, and `0.4884` for
+fastest. Trained MAPPO's completion/rejection rates were `1.0000`/`0.0000`;
+its reward was `0.0015` below fastest. Full per-seed metrics, training curves,
+and episode history are in `results/mappo_reference/`.
+
+## 12. Limitations and responsible interpretation
 
 - Demo predictor/GNN training labels, graph edges, server capacities, and
   offline execution outcomes are synthetic or simulated.
